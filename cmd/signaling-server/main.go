@@ -79,7 +79,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	roomMu.Unlock()
 
-	log.Printf("Client[%v] joined room %s\n", remoteAddr, roomID)
+	var clientId string
 
 	for {
 		messageType, message, err := conn.ReadMessage()
@@ -101,14 +101,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				log.Println("Error unmarshalling message:", err)
 				continue
 			}
+			clientId = registerMsg.Id
 			room.mu.Lock()
-			room.clients[registerMsg.Id] = conn
+			room.clients[clientId] = conn
 			room.mu.Unlock()
 			defer func() {
 				room.mu.Lock()
 				delete(room.clients, registerMsg.Id)
 				room.mu.Unlock()
 			}()
+			log.Printf("Client[%v] joined room [%s]\n", clientId, roomID)
 
 		case common.Candidate, common.Offer, common.Answer:
 			targetedMsg := common.TargetedMsg{}
@@ -136,7 +138,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("Client[%v] left room %s\n", remoteAddr, roomID)
+	log.Printf("Client[%v] left room [%s]\n", clientId, roomID)
 	defer cleanRooms(room, roomID)
 }
 

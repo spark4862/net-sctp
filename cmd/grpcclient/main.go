@@ -217,6 +217,17 @@ func main() {
 		}
 	}()
 
+	registerString, err := json.Marshal(common.RegisterMsg{Id: Src})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := conn.WriteJSON(&common.SignalMsg{
+		Type: common.Register,
+		Data: string(registerString),
+	}); err != nil {
+		log.Fatal(err)
+	}
+
 	offer, err := peerConnection.CreateOffer(nil)
 	if err != nil {
 		log.Fatal(err)
