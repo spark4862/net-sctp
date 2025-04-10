@@ -45,6 +45,12 @@ func main() {
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
+			//{
+			//	URLs: []string{"stun:8.153.200.135:3479"},
+			//},
+			//{
+			//	URLs: []string{"stun:stun.l.google.com:19302"},
+			//},
 			{
 				URLs:       []string{"turn:8.153.200.135:3479"},
 				Username:   "test1",
@@ -57,10 +63,10 @@ func main() {
 	loggerFactory.DefaultLogLevel = logging.LogLevelTrace
 
 	s := webrtc.SettingEngine{}
-	s.SetNetworkTypes([]webrtc.NetworkType{
-		webrtc.NetworkTypeTCP4,
-		webrtc.NetworkTypeTCP6,
-	})
+	//s.SetNetworkTypes([]webrtc.NetworkType{
+	//	webrtc.NetworkTypeTCP4,
+	//	webrtc.NetworkTypeTCP6,
+	//})
 	s.LoggerFactory = loggerFactory
 	s.SetICETimeouts(5*time.Second, 5*time.Second, 5*time.Second)
 
