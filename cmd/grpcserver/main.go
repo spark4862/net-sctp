@@ -1,3 +1,5 @@
+// Deprecated: use grpcclient without -isClient
+
 package main
 
 import (
@@ -7,7 +9,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v3"
-	"github.com/spark4862/net-sctp/pkg/common"
+	"github.com/spark4862/sender/pkg/common"
 	"log"
 	"time"
 )
@@ -15,14 +17,15 @@ import (
 var (
 	signalingServer string
 	roomID          string
-	Dst             string
-	Src             string
+	destination     string
+	source          string
+	isClient        bool = false
 )
 
 func parse() {
 	flag.StringVar(&signalingServer, "server", "ws://localhost:28080/ws", "Signaling server WebSocket URL")
 	flag.StringVar(&roomID, "room", "default", "Room ID (leave empty to create a new room)")
-	flag.StringVar(&Src, "src", "grpc-server", "Src")
+	flag.StringVar(&source, "src", "grpc-server", "Src")
 	flag.Parse()
 }
 
@@ -33,6 +36,7 @@ func connectSignalingServer(pSignalingServer string, pRoomID string) *websocket.
 		err = fmt.Errorf("connectSignalingServer err when Dial: %w", err)
 		log.Fatal(err)
 	}
+	log.Println("connected to signaling server")
 	return conn
 }
 
@@ -146,11 +150,17 @@ func newPeerConnectionOnICECandidate(c *websocket.Conn, src string, dst string) 
 	}
 }
 
-func setDst(dst *string, d string) {
-	*dst = d
-}
+//	func isConnectionFinished(p *webrtc.PeerConnection) bool {
+//		status := p.ConnectionState()
+//		if status >= webrtc.PeerConnectionStateConnected {
+//			return false
+//		}
+//		return true
+//	}
+
 func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection) {
 	for {
+
 		_, rawMsg, err := c.ReadMessage()
 		if err != nil {
 			err = fmt.Errorf("messageHandler err when ReadMessage: %w", err)
@@ -176,7 +186,7 @@ func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection) {
 				log.Println(err)
 				continue
 			}
-			setDst(&Dst, fromTargetedMsg.Src)
+			destination = fromTargetedMsg.Src
 
 			offer := webrtc.SessionDescription{}
 			if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &offer); err != nil {
@@ -212,8 +222,8 @@ func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection) {
 			}
 
 			toTargetedMsg := common.TargetedMsg{
-				Src:  Src,
-				Dst:  Dst,
+				Src:  source,
+				Dst:  destination,
 				Data: string(answerString),
 			}
 			targetedString, err := json.Marshal(toTargetedMsg)
@@ -277,16 +287,75 @@ func sendRegister(c *websocket.Conn, id string) {
 		log.Fatal(err)
 	}
 }
+func setPeerConnection(p *webrtc.PeerConnection, c *websocket.Conn, src string, dst string) {
+	p.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
+	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange())
+	p.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
+	p.OnDataChannel(newPeerConnectionOnDataChannel())
+	p.OnICECandidate(newPeerConnectionOnICECandidate(c, src, dst))
+}
+
+func checkDirectConnection() bool {
+	rID := "checkDirectConnection"
+	connectedSignalCh := make(chan bool)
+
+	conn := connectSignalingServer(signalingServer, rID)
+	defer closeConnection(conn)
+
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:8.153.200.135:3479"},
+			},
+		},
+	}
+
+	s := newSettingEngine(logging.LogLevelInfo)
+
+	peerConnection := newPeerConnection(s, config)
+	setPeerConnection(peerConnection, conn, source, destination)
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		log.Printf("OnICEConnectionStateChange: %s\n", connectionState.String())
+		if connectionState == webrtc.ICEConnectionStateConnected {
+			connectedSignalCh <- true
+		}
+		if connectionState == webrtc.ICEConnectionStateFailed {
+			connectedSignalCh <- false
+		}
+	})
+
+	dataChannel, err := peerConnection.CreateDataChannel(source, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, rID))
+
+	go messageHandler(conn, peerConnection)
+
+	sendRegister(conn, rID)
+
+	var tmp bool
+	select {
+	case tmp = <-connectedSignalCh:
+		//case <-time.After(time.Second * 20):
+		//	log.Println("checkDirectConnection timeout")
+		//	return false
+	}
+
+	if tmp {
+		return true
+	} else {
+		return false
+	}
+}
 
 func init() {
 	parse()
 }
 
 func main() {
-
 	conn := connectSignalingServer(signalingServer, roomID)
 	defer closeConnection(conn)
-	log.Println("connected to signaling server")
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -304,29 +373,24 @@ func main() {
 		},
 	}
 
-	s := newSettingEngine(logging.LogLevelTrace)
+	s := newSettingEngine(logging.LogLevelInfo)
 	//s.SetNetworkTypes([]webrtc.NetworkType{
 	//	webrtc.NetworkTypeTCP4,
 	//	webrtc.NetworkTypeTCP6,
 	//})
 
 	peerConnection := newPeerConnection(s, config)
+	setPeerConnection(peerConnection, conn, source, destination)
 
-	dataChannel, err := peerConnection.CreateDataChannel(Src, nil)
+	dataChannel, err := peerConnection.CreateDataChannel(source, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
 
-	peerConnection.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
-	peerConnection.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange())
-	peerConnection.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
-	peerConnection.OnDataChannel(newPeerConnectionOnDataChannel())
-	peerConnection.OnICECandidate(newPeerConnectionOnICECandidate(conn, Src, Dst))
-
 	go messageHandler(conn, peerConnection)
 
-	sendRegister(conn, Src)
+	sendRegister(conn, source)
 
 	select {}
 }

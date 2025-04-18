@@ -15,7 +15,7 @@ import (
 	"encoding/json"
 	"flag"
 	"github.com/gorilla/websocket"
-	common "github.com/spark4862/net-sctp/pkg/common"
+	common "github.com/spark4862/sender/pkg/common"
 	"log"
 	"net/http"
 	"strconv"
@@ -128,7 +128,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					log.Printf("send message to target[%v]\n", targetedMsg.Dst)
 				}
 			} else {
-				log.Println("Target not found")
+				log.Printf("Target not found %s\n", targetedMsg.Dst)
 				continue
 			}
 

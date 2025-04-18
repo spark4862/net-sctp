@@ -1,8 +1,10 @@
-package main
+// todo: go messageHandler有协程泄漏问题，需要使用channel来解决
+// 目前还有个bug,如果两方同时dial对方，可能会丢失一个datachannel，如果存在较远的先后关系，不会有这个问题
+
+package sender
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/pion/logging"
@@ -10,26 +12,54 @@ import (
 	"github.com/spark4862/sender/pkg/common"
 	"github.com/spark4862/sender/pkg/utils"
 	"log"
+	"sync"
 	"time"
 )
 
 var (
-	signalingServer string
-	roomID          string
-	destination     *string = new(string)
-	source          *string = new(string)
-	// todo 把client和server的代码统一
-	isClient bool = true
+	signalingServer string = "ws://localhost:28080/ws"
+	roomID          string = "default"
+	//	destination     string = "grpc-client"
+	//	source          string = "grpc-server"
+	//	// todo 把client和server的代码统一
+	//	isClient bool = true
+	config webrtc.Configuration = webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs:       []string{"turn:8.153.200.135:3479"},
+				Username:   "test1",
+				Credential: "123456",
+			},
+		},
+	}
+	connInitOnce  sync.Once
+	settingEngine webrtc.SettingEngine = newSettingEngine(logging.LogLevelWarn)
 )
 
-func parse() {
-	flag.BoolVar(&isClient, "isClient", false, "is client")
-	flag.StringVar(&signalingServer, "server", "ws://localhost:28080/ws", "Signaling server WebSocket URL")
-	flag.StringVar(&roomID, "room", "default", "Room ID")
-	flag.StringVar(source, "src", "grpc-client", "name to register")
-	flag.StringVar(destination, "dst", "test-fucker", "name to call")
-	flag.Parse()
+type NatSender struct {
+	// income and dial connections
+	dst2dc map[string]*webrtc.DataChannel
+	// income and dial connections
+	dst2pc map[string]*webrtc.PeerConnection
+	// current Listening pc
+	listeningPc         *webrtc.PeerConnection
+	canAccept           chan struct{}
+	signalingServerConn *websocket.Conn
+	source              string
 }
+
+func newNatSender(source string) *NatSender {
+	return &NatSender{
+		dst2dc:              make(map[string]*webrtc.DataChannel),
+		dst2pc:              make(map[string]*webrtc.PeerConnection),
+		listeningPc:         nil,
+		canAccept:           make(chan struct{}, 1),
+		signalingServerConn: nil,
+		source:              source,
+	}
+}
+
+var _ Sender = &NatSender{}
 
 func connectSignalingServer(pSignalingServer string, rID string) *websocket.Conn {
 	url := fmt.Sprintf("%s?room=%s", pSignalingServer, rID)
@@ -67,24 +97,17 @@ func newPeerConnection(s webrtc.SettingEngine, cfg webrtc.Configuration) *webrtc
 	peerConnection, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		err = fmt.Errorf("newPeerConnection err when NewPeerConnection: %w", err)
-		log.Println(err)
+		log.Fatal(err)
 	}
 	return peerConnection
 }
 
-func newDataChannelOnOpen(dc *webrtc.DataChannel, rID string) func() {
+func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, natSender *NatSender, dst *string) func() {
 	return func() {
+		natSender.dst2dc[*dst] = dc
+		natSender.dst2pc[*dst] = pc
+		natSender.canAccept <- struct{}{}
 		log.Println("OnOpen" + dc.Label())
-		go func() {
-			for {
-				err := dc.SendText(dc.Label() + " send Hello from " + rID)
-				if err != nil {
-					err = fmt.Errorf("newDataChannelOnOpen err when SendText: %w", err)
-					log.Println(err)
-				}
-				time.Sleep(5 * time.Second)
-			}
-		}()
 	}
 }
 
@@ -158,6 +181,7 @@ func newPeerConnectionOnICECandidate(c *websocket.Conn, src *string, dst *string
 func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection, src *string, dst *string, isClient bool) {
 	for {
 		// 阻塞，所以不需要停止go messageHandler
+		// 但会有协程泄漏问题
 		_, rawMsg, err := c.ReadMessage()
 		if utils.ErrorHandler(err) {
 			return
@@ -360,108 +384,82 @@ func setPeerConnection(p *webrtc.PeerConnection, c *websocket.Conn, src *string,
 	p.OnICECandidate(newPeerConnectionOnICECandidate(c, src, dst))
 }
 
-//func checkDirectConnection() bool {
-//	rID := "checkDirectConnection"
-//	connectedSignalCh := make(chan bool)
-//
-//	conn := connectSignalingServer(signalingServer, rID)
-//	defer closeConnection(conn)
-//
-//	config := webrtc.Configuration{
-//		ICEServers: []webrtc.ICEServer{
-//			{
-//				URLs: []string{"stun:8.153.200.135:3479"},
-//			},
-//		},
-//	}
-//
-//	s := newSettingEngine(logging.LogLevelInfo)
-//
-//	peerConnection := newPeerConnection(s, config)
-//	setPeerConnection(peerConnection, conn, source, destination)
-//	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-//		log.Printf("OnICEConnectionStateChange: %s\n", connectionState.String())
-//		if connectionState == webrtc.ICEConnectionStateConnected {
-//			connectedSignalCh <- true
-//		}
-//		if connectionState == webrtc.ICEConnectionStateFailed {
-//			connectedSignalCh <- false
-//		}
-//	})
-//
-//	dataChannel, err := peerConnection.CreateDataChannel(source, nil)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, rID))
-//
-//	go messageHandler(conn, peerConnection)
-//
-//	sendRegister(conn, rID)
-//
-//	offer := newAndSetOffer(peerConnection)
-//	sendOffer(offer, conn, source, destination)
-//
-//	var tmp bool
-//	select {
-//	case tmp = <-connectedSignalCh:
-//	case <-time.After(time.Second * 20):
-//		log.Println("checkDirectConnection timeout")
-//		return false
-//	}
-//
-//	if tmp {
-//		return true
-//	} else {
-//		return false
-//	}
-//}
-
-func init() {
-	parse()
-}
-func main() {
-	conn := connectSignalingServer(signalingServer, roomID)
-	sendRegister(conn, *source)
-	defer closeConnection(conn)
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			//{
-			//	URLs: []string{"stun:8.153.200.135:3479"},
-			//},
-			//{
-			//	URLs: []string{"stun:stun.l.google.com:19302"},
-			//},
-			{
-				URLs:       []string{"turn:8.153.200.135:3479"},
-				Username:   "test1",
-				Credential: "123456",
-			},
-		},
+func initConn(conn *websocket.Conn, src string) *websocket.Conn {
+	if conn == nil {
+		connInitOnce.Do(func() {
+			conn = connectSignalingServer(signalingServer, roomID)
+			sendRegister(conn, src)
+		})
 	}
+	return conn
+}
 
-	s := newSettingEngine(logging.LogLevelWarn)
-	//s.SetNetworkTypes([]webrtc.NetworkType{
-	//	webrtc.NetworkTypeTCP4,
-	//	webrtc.NetworkTypeTCP6,
-	//})
+func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
+	dc, ok := natSender.dst2dc[dst]
+	if ok {
+		return dc
+	} else {
+		source := &(natSender.source)
+		destination := &dst
+		natSender.signalingServerConn = initConn(natSender.signalingServerConn, natSender.source)
 
-	peerConnection := newPeerConnection(s, config)
-	setPeerConnection(peerConnection, conn, source, destination)
+		peerConnection := newPeerConnection(settingEngine, config)
+		setPeerConnection(peerConnection, natSender.signalingServerConn, source, destination)
+		dataChannel, err := peerConnection.CreateDataChannel(*source, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, peerConnection, natSender, destination))
+		go messageHandler(natSender.signalingServerConn, peerConnection, source, destination, false)
+		offer := newAndSetOffer(peerConnection)
+		sendOffer(offer, natSender.signalingServerConn, *source, *destination)
+	}
+	return dc
+}
 
-	dataChannel, err := peerConnection.CreateDataChannel(*source, nil)
+func (natSender *NatSender) Send(dst string, data string) {
+	dc := natSender.dial(dst)
+	if dc == nil {
+		log.Println("destination is not online")
+		return
+	}
+	if err := dc.SendText(data); err != nil {
+		err = fmt.Errorf("NatSender.Send err when SendText: %w", err)
+		log.Println(err)
+	}
+}
+
+func (natSender *NatSender) Listen() {
+	//这个可以先尝试直连，不行再用server转发，反正打洞的方式不行也是要转发的，但是打洞方式有一个缺点，就是就算要turn转发，它还是p2p的
+	if natSender.listeningPc != nil {
+		panic("Listen is called more than once")
+	}
+	source := &(natSender.source)
+	destination := new(string)
+	natSender.signalingServerConn = initConn(natSender.signalingServerConn, natSender.source)
+
+	natSender.listeningPc = newPeerConnection(settingEngine, config)
+	setPeerConnection(natSender.listeningPc, natSender.signalingServerConn, source, destination)
+	dataChannel, err := natSender.listeningPc.CreateDataChannel(*source, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
+	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, natSender.listeningPc, natSender, destination))
+	go messageHandler(natSender.signalingServerConn, natSender.listeningPc, source, destination, false)
+}
 
-	go messageHandler(conn, peerConnection, source, destination, isClient)
+func (natSender *NatSender) Accept() {
+	<-natSender.canAccept
+	natSender.listeningPc = nil
+	destination := new(string)
+	source := &natSender.source
 
-	if isClient {
-		offer := newAndSetOffer(peerConnection)
-		sendOffer(offer, conn, *source, *destination)
+	natSender.listeningPc = newPeerConnection(settingEngine, config)
+	setPeerConnection(natSender.listeningPc, natSender.signalingServerConn, source, destination)
+	dataChannel, err := natSender.listeningPc.CreateDataChannel(*source, nil)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	select {}
+	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, natSender.listeningPc, natSender, destination))
+	go messageHandler(natSender.signalingServerConn, natSender.listeningPc, source, destination, false)
 }
