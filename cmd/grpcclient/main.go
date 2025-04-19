@@ -16,14 +16,11 @@ import (
 var (
 	signalingServer string
 	roomID          string
-	destination     *string = new(string)
-	source          *string = new(string)
-	// todo 把client和server的代码统一
-	isClient    bool                = true
-	dataChannel *webrtc.DataChannel = nil
+	destination     *string             = new(string)
+	source          *string             = new(string)
+	isClient        bool                = true
+	dataChannel     *webrtc.DataChannel = nil
 )
-
-// todo 可能可以用 dst + label，label协商得到，用于区分不同连接的消息
 
 func parse() {
 	flag.BoolVar(&isClient, "isClient", false, "is client")
@@ -177,14 +174,14 @@ func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection, src *string, ds
 	for {
 		// 阻塞，所以不需要停止go messageHandler
 		_, rawMsg, err := c.ReadMessage()
-		if utils.ErrorHandler(err) {
+		if utils.ErrorHandler(err, 1) {
 			return
 		}
 		log.Println("recv msg from signaling server")
 
 		var msg common.SignalMsg
 		err = json.Unmarshal(rawMsg, &msg)
-		if utils.ErrorHandler(err) {
+		if utils.ErrorHandler(err, 1) {
 			continue
 		}
 
@@ -378,6 +375,59 @@ func setPeerConnection(p *webrtc.PeerConnection, c *websocket.Conn, src *string,
 	p.OnICECandidate(newPeerConnectionOnICECandidate(c, src, dst))
 }
 
+func init() {
+	parse()
+}
+func main() {
+	conn := connectSignalingServer(signalingServer, roomID)
+	sendRegister(conn, *source)
+	defer closeConnection(conn)
+
+	config := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+
+			{
+				URLs:       []string{"turn:8.153.200.135:3479"},
+				Username:   "test1",
+				Credential: "123456",
+			},
+		},
+	}
+
+	s := newSettingEngine(logging.LogLevelWarn)
+
+	peerConnection := newPeerConnection(s, config)
+	setPeerConnection(peerConnection, conn, source, destination)
+
+	if isClient {
+		var err error
+		dataChannel, err = peerConnection.CreateDataChannel(*source, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
+		dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
+			log.Printf("OnMessage '%s': '%s'\n", dataChannel.Label(), string(msg.Data))
+		})
+	}
+
+	go messageHandler(conn, peerConnection, source, destination, isClient)
+
+	if isClient {
+		offer := newAndSetOffer(peerConnection)
+		sendOffer(offer, conn, *source, *destination)
+	}
+
+	select {}
+}
+
+//{
+//	URLs: []string{"stun:8.153.200.135:3479"},
+//},
+//{
+//	URLs: []string{"stun:stun.l.google.com:19302"},
+//},
+
 //func checkDirectConnection() bool {
 //	rID := "checkDirectConnection"
 //	connectedSignalCh := make(chan bool)
@@ -434,58 +484,3 @@ func setPeerConnection(p *webrtc.PeerConnection, c *websocket.Conn, src *string,
 //		return false
 //	}
 //}
-
-func init() {
-	parse()
-}
-func main() {
-	conn := connectSignalingServer(signalingServer, roomID)
-	sendRegister(conn, *source)
-	defer closeConnection(conn)
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			//{
-			//	URLs: []string{"stun:8.153.200.135:3479"},
-			//},
-			//{
-			//	URLs: []string{"stun:stun.l.google.com:19302"},
-			//},
-			{
-				URLs:       []string{"turn:8.153.200.135:3479"},
-				Username:   "test1",
-				Credential: "123456",
-			},
-		},
-	}
-
-	s := newSettingEngine(logging.LogLevelWarn)
-	//s.SetNetworkTypes([]webrtc.NetworkType{
-	//	webrtc.NetworkTypeTCP4,
-	//	webrtc.NetworkTypeTCP6,
-	//})
-
-	peerConnection := newPeerConnection(s, config)
-	setPeerConnection(peerConnection, conn, source, destination)
-
-	if isClient {
-		var err error
-		dataChannel, err = peerConnection.CreateDataChannel(*source, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-		dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
-		dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("OnMessage '%s': '%s'\n", dataChannel.Label(), string(msg.Data))
-		})
-	}
-
-	go messageHandler(conn, peerConnection, source, destination, isClient)
-
-	if isClient {
-		offer := newAndSetOffer(peerConnection)
-		sendOffer(offer, conn, *source, *destination)
-	}
-
-	select {}
-}

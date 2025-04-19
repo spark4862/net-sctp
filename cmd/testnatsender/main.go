@@ -26,19 +26,23 @@ func init() {
 func main() {
 	natSender := sender.NewNatSender(*source)
 	// 实现有点问题，应该吧
-	if !isSender {
-		natSender.Listen()
-		go func() {
-			for {
-				natSender.Accept()
-			}
-		}()
-	}
+
+	// 把dispatcher放到listen里面了，必须执行Listen
+	natSender.Listen()
+	go func() {
+		for {
+			natSender.Accept()
+		}
+	}()
+
 	if isSender {
 		for {
 			natSender.Send(*destination, "hello")
-			time.Sleep(3)
+			time.Sleep(3 * time.Second)
 		}
 	}
 	select {}
 }
+
+// go run . -src c1
+// ./testnatsender -src c2 -dst c1 -isSender

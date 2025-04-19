@@ -1,6 +1,7 @@
 // todo: go messageHandler有协程泄漏问题，需要使用channel来解决
 // todo: 还未解决资源回收问题
 // todo: 目前还有个bug,如果两方同时dial对方，可能会丢失一个datachannel，如果存在较远的先后关系，不会有这个问题
+// todo: webrtc的datachannel在connected可能变为disconnecting,应该在disconnecting后回收资源，防止再次connected后造成连接状态问题
 
 package sender
 
@@ -118,6 +119,7 @@ func (natSender *NatSender) setDst2SdpCh(dst string, ch chan []byte) {
 	natSender.dst2SdpChMu.Lock()
 	defer natSender.dst2SdpChMu.Unlock()
 	natSender.dst2SdpCh[dst] = ch
+	log.Printf("setDst2SdpCh %s", dst)
 }
 
 func (natSender *NatSender) getDst2SdpCh(dst string) (ch chan []byte, ok bool) {
@@ -133,7 +135,6 @@ func (natSender *NatSender) sdpDispatcher() {
 		if utils.ErrorHandler(err, 1) {
 			return
 		}
-		log.Println("recv msg from signaling server")
 		var msg common.SignalMsg
 		var targetedMsg common.TargetedMsg
 		err = json.Unmarshal(rawMsg, &msg)
@@ -145,13 +146,16 @@ func (natSender *NatSender) sdpDispatcher() {
 			continue
 		}
 
-		dst := targetedMsg.Dst
+		dst := targetedMsg.Src
 		ch, ok := natSender.getDst2SdpCh(dst)
+		//tmp := dst
 		if !ok {
 			natSender.listeningSdpCh <- rawMsg
+			//tmp = "listening"
 		} else {
 			ch <- rawMsg
 		}
+		//log.Printf("dispatch sdp to %s %s\n", dst, tmp)
 	}
 }
 
@@ -167,13 +171,13 @@ func connectSignalingServer(pSignalingServer string, rID string) *websocket.Conn
 	return conn
 }
 
-func closeConnection(c *websocket.Conn) {
-	err := c.Close()
-	if err != nil {
-		err = fmt.Errorf("closeConnection err when Close: %w", err)
-		log.Println(err)
-	}
-}
+//func closeConnection(c *websocket.Conn) {
+//	err := c.Close()
+//	if err != nil {
+//		err = fmt.Errorf("closeConnection err when Close: %w", err)
+//		log.Println(err)
+//	}
+//}
 
 func newSettingEngine(l logging.LogLevel) webrtc.SettingEngine {
 	s := webrtc.SettingEngine{}
@@ -196,13 +200,16 @@ func newPeerConnection(s webrtc.SettingEngine, cfg webrtc.Configuration) *webrtc
 	return peerConnection
 }
 
-func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, natSender *NatSender, dst *string) func() {
+func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, natSender *NatSender, dst *string, succeeded chan bool) func() {
 	return func() {
 		natSender.setDst2dc(*dst, dc)
 		natSender.setDst2pc(*dst, pc)
 
 		//natSender.canAccept <- struct{}{}
 		log.Println("OnOpen" + dc.Label())
+		if succeeded != nil {
+			succeeded <- true
+		}
 	}
 }
 
@@ -212,16 +219,23 @@ func newPeerConnectionOnICEConnectionStateChange() func(connectionState webrtc.I
 	}
 }
 
-func newPeerConnectionOnConnectionStateChange(succeeded chan bool) func(s webrtc.PeerConnectionState) {
+func newPeerConnectionOnConnectionStateChange() func(s webrtc.PeerConnectionState) {
+	//var done bool
 	return func(s webrtc.PeerConnectionState) {
-		if succeeded != nil {
-			if s == webrtc.PeerConnectionStateConnected {
-				succeeded <- true
-			}
-			if s == webrtc.PeerConnectionStateFailed {
-				succeeded <- false
-			}
-		}
+		//if succeeded != nil {
+		//	if s == webrtc.PeerConnectionStateConnected {
+		//		if !done {
+		//			succeeded <- true
+		//			done = true
+		//		}
+		//	}
+		//	if s == webrtc.PeerConnectionStateFailed {
+		//		if !done {
+		//			succeeded <- false
+		//			done = true
+		//		}
+		//	}
+		//}
 		log.Printf("OnConnectionStateChange: %s\n", s.String())
 	}
 }
@@ -241,6 +255,7 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 			natSender.setDst2pc(*dst, natSender.listeningPc)
 			natSender.setDst2SdpCh(*dst, natSender.listeningSdpCh)
 			natSender.canAccept <- struct{}{}
+			dc.SendText("hello from server")
 			log.Printf("OnOpen '%s'-'%d'\n", dc.Label(), dc.ID())
 		})
 
@@ -287,7 +302,6 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 		// 阻塞，所以不需要停止go sdpHandler
 		// 但会有协程泄漏问题
 		rawMsg := <-ch
-		log.Println("recv msg from signaling server")
 
 		var msg common.SignalMsg
 		err := json.Unmarshal(rawMsg, &msg)
@@ -471,11 +485,10 @@ func sendOffer(o webrtc.SessionDescription, c *connWithMu, src string, dst strin
 	log.Println("send offer to signaling server ok")
 }
 
-func setPeerConnection(natSender *NatSender, src *string, dst *string, succeed chan bool) {
-	p := natSender.listeningPc
+func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *string, dst *string) {
 	c := natSender.signalingServerConn
 	p.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
-	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange(succeed))
+	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange())
 	p.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
 	p.OnDataChannel(newPeerConnectionOnDataChannel(natSender, dst))
 	p.OnICECandidate(newPeerConnectionOnICECandidate(c, src, dst))
@@ -504,27 +517,44 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 		natSender.signalingServerConn.conn = initConn(natSender.signalingServerConn.conn, natSender.source)
 
 		peerConnection := newPeerConnection(settingEngine, config)
-		setPeerConnection(natSender, source, destination, succeeded)
+		setPeerConnection(peerConnection, natSender, source, destination)
 		var err error
 		dc, err = peerConnection.CreateDataChannel(*source, nil)
 		if err != nil {
 			log.Fatal(err)
 		}
-		dc.OnOpen(newDataChannelOnOpen(dc, peerConnection, natSender, destination))
+		dc.OnOpen(newDataChannelOnOpen(dc, peerConnection, natSender, destination, succeeded))
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
+		})
 		ch := make(chan []byte)
 		natSender.setDst2SdpCh(*destination, ch)
 		go sdpHandler(natSender.signalingServerConn, ch, peerConnection, source, destination, true)
 		offer := newAndSetOffer(peerConnection)
 		sendOffer(offer, natSender.signalingServerConn, *source, *destination)
-		if <-succeeded {
-			return dc
-		} else {
+		select {
+		case <-time.After(time.Second * 5):
+			log.Println("test1")
 			utils.ErrorHandler(dc.Close(), 1)
 			utils.ErrorHandler(peerConnection.Close(), 1)
 			close(ch)
 			natSender.setDst2SdpCh(*destination, nil)
 			return nil
+		case <-succeeded:
+			log.Printf("dc state:%d\n", dc.ReadyState())
+			return dc
 		}
+		//if <-succeeded {
+		//	log.Printf("dc state:%d\n", dc.ReadyState())
+		//	return dc
+		//} else {
+		//	log.Println("test1")
+		//	utils.ErrorHandler(dc.Close(), 1)
+		//	utils.ErrorHandler(peerConnection.Close(), 1)
+		//	close(ch)
+		//	natSender.setDst2SdpCh(*destination, nil)
+		//	return nil
+		//}
 	}
 }
 
@@ -550,33 +580,25 @@ func (natSender *NatSender) Listen() {
 	natSender.signalingServerConn.conn = initConn(natSender.signalingServerConn.conn, natSender.source)
 
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
-	setPeerConnection(natSender, source, destination, nil)
-	//dataChannel, err := natSender.listeningPc.CreateDataChannel(*source, nil)
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
-	//dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, natSender.listeningPc, natSender, destination))
+	setPeerConnection(natSender.listeningPc, natSender, source, destination)
 	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
 	go natSender.sdpDispatcher()
 }
 
 func (natSender *NatSender) Accept() {
 	<-natSender.canAccept
+	log.Println("start accept")
 	natSender.listeningPc = nil
 	// set to update listener
 	destination := new(string)
 	source := &natSender.source
 
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
-	setPeerConnection(natSender, source, destination, nil)
+	setPeerConnection(natSender.listeningPc, natSender, source, destination)
 	natSender.listeningSdpCh = make(chan []byte)
-	//dataChannel, err := natSender.listeningPc.CreateDataChannel(*source, nil)
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
-	//dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, natSender.listeningPc, natSender, destination))
 
 	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
+
 }
 
 func (natSender *NatSender) Close() {
