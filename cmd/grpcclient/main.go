@@ -19,8 +19,11 @@ var (
 	destination     *string = new(string)
 	source          *string = new(string)
 	// todo 把client和server的代码统一
-	isClient bool = true
+	isClient    bool                = true
+	dataChannel *webrtc.DataChannel = nil
 )
+
+// todo 可能可以用 dst + label，label协商得到，用于区分不同连接的消息
 
 func parse() {
 	flag.BoolVar(&isClient, "isClient", false, "is client")
@@ -88,6 +91,12 @@ func newDataChannelOnOpen(dc *webrtc.DataChannel, rID string) func() {
 	}
 }
 
+func newDataChannelOnMessage(dc *webrtc.DataChannel, rID string) func(msg webrtc.DataChannelMessage) {
+	return func(msg webrtc.DataChannelMessage) {
+		log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
+	}
+}
+
 func newPeerConnectionOnICEConnectionStateChange() func(connectionState webrtc.ICEConnectionState) {
 	return func(connectionState webrtc.ICEConnectionState) {
 		log.Printf("OnICEConnectionStateChange: %s\n", connectionState.String())
@@ -109,9 +118,18 @@ func newPeerConnectionOnSignalingStateChange() func(s webrtc.SignalingState) {
 func newPeerConnectionOnDataChannel() func(*webrtc.DataChannel) {
 	return func(dc *webrtc.DataChannel) {
 		log.Printf("OnDataChannel %s %d\n", dc.Label(), dc.ID())
-
+		dataChannel = dc
 		dc.OnOpen(func() {
 			log.Printf("OnOpen '%s'-'%d'\n", dc.Label(), dc.ID())
+			go func() {
+				for {
+					err := dc.SendText("Hello from " + roomID)
+					if err != nil {
+						log.Println(err)
+					}
+					time.Sleep(5 * time.Second)
+				}
+			}()
 		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -450,11 +468,17 @@ func main() {
 	peerConnection := newPeerConnection(s, config)
 	setPeerConnection(peerConnection, conn, source, destination)
 
-	dataChannel, err := peerConnection.CreateDataChannel(*source, nil)
-	if err != nil {
-		log.Fatal(err)
+	if isClient {
+		var err error
+		dataChannel, err = peerConnection.CreateDataChannel(*source, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
+		dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
+			log.Printf("OnMessage '%s': '%s'\n", dataChannel.Label(), string(msg.Data))
+		})
 	}
-	dataChannel.OnOpen(newDataChannelOnOpen(dataChannel, roomID))
 
 	go messageHandler(conn, peerConnection, source, destination, isClient)
 

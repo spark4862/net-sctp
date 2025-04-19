@@ -20,6 +20,7 @@ SignalMsg{
 */
 type SignalType int
 
+// 这块的实现也有问题，用继承会更好些，或者吧marshal 和 unmarshal 做成接口，直接用marshal有点麻烦
 const (
 	Offer SignalType = iota
 	Answer
