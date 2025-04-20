@@ -28,12 +28,14 @@ func main() {
 	// 实现有点问题，应该吧
 
 	// 把dispatcher放到listen里面了，必须执行Listen
-	natSender.Listen()
-	go func() {
-		for {
-			natSender.Accept()
-		}
-	}()
+	if !isSender {
+		natSender.Listen()
+		go func() {
+			for {
+				natSender.Accept()
+			}
+		}()
+	}
 
 	if isSender {
 		for {

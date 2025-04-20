@@ -1,4 +1,4 @@
-// todo: go messageHandler有协程泄漏问题，需要使用channel来解决
+// todo: go messageHandler有协程泄漏问题，需要使用channel?来解决
 // todo: 还未解决资源回收问题
 // todo: 目前还有个bug,如果两方同时dial对方，可能会丢失一个datachannel，如果存在较远的先后关系，不会有这个问题
 // todo: webrtc的datachannel在connected可能变为disconnecting,应该在disconnecting后回收资源，防止再次connected后造成连接状态问题
@@ -10,21 +10,18 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/pion/logging"
-	"github.com/pion/webrtc/v3"
+	webrtc "github.com/pion/webrtc/v3"
 	"github.com/spark4862/sender/pkg/common"
-	"github.com/spark4862/sender/pkg/utils"
+	eh "github.com/spark4862/sender/pkg/utils/errorhandler"
 	"log"
 	"sync"
 	"time"
 )
 
 var (
-	signalingServer string = "ws://8.153.200.135:28080/ws"
-	roomID          string = "default"
-	//	destination     string = "grpc-client"
-	//	source          string = "grpc-server"
-	//	isClient bool = true
-	config webrtc.Configuration = webrtc.Configuration{
+	signalingServer string               = "ws://8.153.200.135:28080/ws"
+	roomID          string               = "default"
+	config          webrtc.Configuration = webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
 				URLs:       []string{"turn:8.153.200.135:3479"},
@@ -33,7 +30,6 @@ var (
 			},
 		},
 	}
-	connInitOnce  sync.Once
 	settingEngine webrtc.SettingEngine = newSettingEngine(logging.LogLevelWarn)
 )
 
@@ -47,18 +43,16 @@ func (c *connWithMu) writeJSON(v interface{}) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	err := c.conn.WriteJSON(v)
-	utils.ErrorHandler(err, 2)
+	eh.ErrorHandler(err, 2, eh.LogAndPanic)
 }
 
 type NatSender struct {
-	// income and dial connections
-	// todo: map操作未加锁
 	dst2dc   map[string]*webrtc.DataChannel
 	dst2dcMu sync.RWMutex
 	// income and dial connections
 	dst2pc   map[string]*webrtc.PeerConnection
 	dst2pcMu sync.RWMutex
-	// messagehandler应该只接受自己的消息，而不是从与signalingserver的连接中接受所有消息，需要实现消息分派机制
+	// messageHandler应该只接受自己的消息，而不是从与signalingServer的连接中接受所有消息，需要实现消息分派机制
 	dst2SdpCh      map[string]chan []byte
 	dst2SdpChMu    sync.RWMutex
 	listeningSdpCh chan []byte
@@ -66,14 +60,12 @@ type NatSender struct {
 	listeningPc *webrtc.PeerConnection
 	canAccept   chan struct{}
 	// 用锁来保护多协程写，用chan确保单协程读
-	//signalingServerConn *websocket.Conn
-	//connMu sync.Mutex
 	signalingServerConn *connWithMu
 	source              string
 }
 
 func NewNatSender(source string) *NatSender {
-	return &NatSender{
+	ns := &NatSender{
 		dst2dc:         make(map[string]*webrtc.DataChannel),
 		dst2pc:         make(map[string]*webrtc.PeerConnection),
 		dst2SdpCh:      make(map[string]chan []byte),
@@ -81,10 +73,13 @@ func NewNatSender(source string) *NatSender {
 		listeningPc:    nil,
 		canAccept:      make(chan struct{}),
 		signalingServerConn: &connWithMu{
-			conn: nil,
+			conn: connectSignalingServer(signalingServer, roomID),
 		},
 		source: source,
 	}
+	sendRegister(ns.signalingServerConn.conn, source)
+	go ns.sdpDispatcher()
+	return ns
 }
 
 var _ Sender = &NatSender{}
@@ -132,40 +127,34 @@ func (natSender *NatSender) getDst2SdpCh(dst string) (ch chan []byte, ok bool) {
 func (natSender *NatSender) sdpDispatcher() {
 	for {
 		_, rawMsg, err := natSender.signalingServerConn.conn.ReadMessage()
-		if utils.ErrorHandler(err, 1) {
+		if eh.ErrorHandler(err, 1, eh.LogOnly) {
 			return
 		}
 		var msg common.SignalMsg
 		var targetedMsg common.TargetedMsg
 		err = json.Unmarshal(rawMsg, &msg)
-		if utils.ErrorHandler(err, 1) {
+		if eh.ErrorHandler(err, 1, eh.LogOnly) {
 			continue
 		}
 		err = json.Unmarshal([]byte(msg.Data), &targetedMsg)
-		if utils.ErrorHandler(err, 1) {
+		if eh.ErrorHandler(err, 1, eh.LogOnly) {
 			continue
 		}
 
 		dst := targetedMsg.Src
 		ch, ok := natSender.getDst2SdpCh(dst)
-		//tmp := dst
 		if !ok {
 			natSender.listeningSdpCh <- rawMsg
-			//tmp = "listening"
 		} else {
 			ch <- rawMsg
 		}
-		//log.Printf("dispatch sdp to %s %s\n", dst, tmp)
 	}
 }
 
 func connectSignalingServer(pSignalingServer string, rID string) *websocket.Conn {
 	url := fmt.Sprintf("%s?room=%s", pSignalingServer, rID)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		err = fmt.Errorf("connectSignalingServer err when Dial: %w", err)
-		log.Fatal(err)
-	}
+	eh.ErrorHandler(err, 1, eh.LogAndPanic)
 
 	log.Println("connected to signaling server")
 	return conn
@@ -193,10 +182,7 @@ func newSettingEngine(l logging.LogLevel) webrtc.SettingEngine {
 func newPeerConnection(s webrtc.SettingEngine, cfg webrtc.Configuration) *webrtc.PeerConnection {
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
 	peerConnection, err := api.NewPeerConnection(cfg)
-	if err != nil {
-		err = fmt.Errorf("newPeerConnection err when NewPeerConnection: %w", err)
-		log.Fatal(err)
-	}
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
 	return peerConnection
 }
 
@@ -205,7 +191,6 @@ func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, nat
 		natSender.setDst2dc(*dst, dc)
 		natSender.setDst2pc(*dst, pc)
 
-		//natSender.canAccept <- struct{}{}
 		log.Println("OnOpen" + dc.Label())
 		if succeeded != nil {
 			succeeded <- true
@@ -220,22 +205,7 @@ func newPeerConnectionOnICEConnectionStateChange() func(connectionState webrtc.I
 }
 
 func newPeerConnectionOnConnectionStateChange() func(s webrtc.PeerConnectionState) {
-	//var done bool
 	return func(s webrtc.PeerConnectionState) {
-		//if succeeded != nil {
-		//	if s == webrtc.PeerConnectionStateConnected {
-		//		if !done {
-		//			succeeded <- true
-		//			done = true
-		//		}
-		//	}
-		//	if s == webrtc.PeerConnectionStateFailed {
-		//		if !done {
-		//			succeeded <- false
-		//			done = true
-		//		}
-		//	}
-		//}
 		log.Printf("OnConnectionStateChange: %s\n", s.String())
 	}
 }
@@ -255,7 +225,8 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 			natSender.setDst2pc(*dst, natSender.listeningPc)
 			natSender.setDst2SdpCh(*dst, natSender.listeningSdpCh)
 			natSender.canAccept <- struct{}{}
-			dc.SendText("hello from server")
+			err := dc.SendText("hello from server")
+			eh.ErrorHandler(err, 1, eh.LogAndPanic)
 			log.Printf("OnOpen '%s'-'%d'\n", dc.Label(), dc.ID())
 		})
 
@@ -272,22 +243,14 @@ func newPeerConnectionOnICECandidate(c *connWithMu, src *string, dst *string) fu
 		}
 
 		candidateString, err := json.Marshal(i.ToJSON())
-		if err != nil {
-			err = fmt.Errorf("newPeerConnectionOnICECandidate err when Marshal0: %w", err)
-			log.Println(err)
-			return
-		}
+		eh.ErrorHandler(err, 1, eh.LogAndPanic)
 		targetedMsg := common.TargetedMsg{
 			Src:  *src,
 			Dst:  *dst,
 			Data: string(candidateString),
 		}
 		targetedString, err := json.Marshal(targetedMsg)
-		if err != nil {
-			err = fmt.Errorf("newPeerConnectionOnICECandidate err when Marshal1: %w", err)
-			log.Println(err)
-			return
-		}
+		eh.ErrorHandler(err, 1, eh.LogAndPanic)
 		c.writeJSON(&common.SignalMsg{
 			Type: common.Candidate,
 			Data: string(targetedString),
@@ -305,7 +268,7 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 
 		var msg common.SignalMsg
 		err := json.Unmarshal(rawMsg, &msg)
-		if utils.ErrorHandler(err, 1) {
+		if eh.ErrorHandler(err, 1, eh.LogOnly) {
 			continue
 		}
 
@@ -314,75 +277,55 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 			if isClient {
 				log.Println("recv a answer msg")
 				fromTargetedMsg := common.TargetedMsg{}
-				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); err != nil {
-					err = fmt.Errorf("sdpHandler err when Unmarshal1: %w", err)
-					log.Println(err)
+				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 				answer := webrtc.SessionDescription{}
-				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &answer); err != nil {
-					err = fmt.Errorf("sdpHandler err when Unmarshal2: %w", err)
-					log.Println(err)
+				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
-				if err := p.SetRemoteDescription(answer); err != nil {
-					err = fmt.Errorf("sdpHandler err when SetRemoteDescription: %w", err)
-					log.Println(err)
+				if err := p.SetRemoteDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
 				log.Println("set remote desc for answer ok")
 			} else {
-				err := fmt.Errorf("sdpHandler err: should never receive answer")
-				log.Println(err)
+				log.Println(fmt.Errorf("sdpHandler err: should never receive answer"))
 				continue
 			}
 		case common.Offer:
 			if isClient {
-				err := fmt.Errorf("sdpHandler err: should never receive offer")
-				log.Println(err)
+				log.Println(fmt.Errorf("sdpHandler err: should never receive offer"))
 				continue
 			} else {
 				log.Println("recv a offer msg")
 				fromTargetedMsg := common.TargetedMsg{}
-				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); err != nil {
-					err = fmt.Errorf("sdpHandler err when Unmarshal1: %w", err)
-					log.Println(err)
+				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 				*dst = fromTargetedMsg.Src
 
 				offer := webrtc.SessionDescription{}
-				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &offer); err != nil {
-					err = fmt.Errorf("sdpHandler err when Unmarshal2: %w", err)
-					log.Println(err)
+				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
-				if err := p.SetRemoteDescription(offer); err != nil {
-					err = fmt.Errorf("sdpHandler err when SetRemoteDescription: %w", err)
-					log.Println(err)
+				if err := p.SetRemoteDescription(offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
 				answer, err := p.CreateAnswer(nil)
-				if err != nil {
-					err = fmt.Errorf("sdpHandler err when CreateAnswer: %w", err)
-					log.Println(err)
+				if eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
-				if err := p.SetLocalDescription(answer); err != nil {
-					err = fmt.Errorf("sdpHandler err when SetLocalDescription: %w", err)
-					log.Println(err)
+				if err := p.SetLocalDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
 				answerString, err := json.Marshal(answer)
-				if err != nil {
-					err = fmt.Errorf("sdpHandler err when Marshal0: %w", err)
-					log.Println(err)
+				if eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
@@ -392,9 +335,7 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 					Data: string(answerString),
 				}
 				targetedString, err := json.Marshal(toTargetedMsg)
-				if err != nil {
-					err = fmt.Errorf("sdpHandler err when Marshal1: %w", err)
-					log.Println(err)
+				if eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
@@ -406,22 +347,16 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 			}
 		case common.Candidate:
 			fromTargetedMsg := common.TargetedMsg{}
-			if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); err != nil {
-				err = fmt.Errorf("sdpHandler err when Unmarshal3: %w", err)
-				log.Println(err)
+			if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 				continue
 			}
 
 			candidate := webrtc.ICECandidateInit{}
-			if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &candidate); err != nil {
-				err = fmt.Errorf("sdpHandler err when Unmarshal4: %w", err)
-				log.Println(err)
+			if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
 				continue
 			}
 
-			if err := p.AddICECandidate(candidate); err != nil {
-				err = fmt.Errorf("sdpHandler err when AddICECandidate: %w", err)
-				log.Println(err)
+			if err := p.AddICECandidate(candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
 				continue
 			}
 
@@ -434,49 +369,36 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 
 func sendRegister(c *websocket.Conn, id string) {
 	registerString, err := json.Marshal(common.RegisterMsg{Id: id})
-	if err != nil {
-		err = fmt.Errorf("sendRegister err when Marshal: %w", err)
-		log.Fatal(err)
-	}
-	if err := c.WriteJSON(&common.SignalMsg{
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
+
+	err = c.WriteJSON(&common.SignalMsg{
 		Type: common.Register,
 		Data: string(registerString),
-	}); err != nil {
-		err = fmt.Errorf("sendRegister err when WriteJSON: %w", err)
-		log.Fatal(err)
-	}
+	})
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
 }
 
 func newAndSetOffer(peerConnection *webrtc.PeerConnection) webrtc.SessionDescription {
 	offer, err := peerConnection.CreateOffer(nil)
-	if err != nil {
-		err = fmt.Errorf("newAndSetOffer err when CreateOffer: %w", err)
-		log.Fatal(err)
-	}
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
 
-	if err := peerConnection.SetLocalDescription(offer); err != nil {
-		err = fmt.Errorf("newAndSetOffer err when SetLocalDescription: %w", err)
-		log.Fatal(err)
-	}
+	err = peerConnection.SetLocalDescription(offer)
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
 	return offer
 }
 
 func sendOffer(o webrtc.SessionDescription, c *connWithMu, src string, dst string) {
 	offerString, err := json.Marshal(o)
-	if err != nil {
-		err = fmt.Errorf("sendOffer err when Marshal0: %w", err)
-		log.Fatal(err)
-	}
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
+
 	targetedMsg := common.TargetedMsg{
 		Src:  src,
 		Dst:  dst,
 		Data: string(offerString),
 	}
 	targetedString, err := json.Marshal(targetedMsg)
-	if err != nil {
-		err = fmt.Errorf("sendOffer err when Marshal1: %w", err)
-		log.Fatal(err)
-	}
+	eh.ErrorHandler(err, 1, eh.LogAndFatal)
+
 	c.writeJSON(&common.SignalMsg{
 		Type: common.Offer,
 		Data: string(targetedString),
@@ -486,23 +408,11 @@ func sendOffer(o webrtc.SessionDescription, c *connWithMu, src string, dst strin
 }
 
 func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *string, dst *string) {
-	c := natSender.signalingServerConn
 	p.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
 	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange())
 	p.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
 	p.OnDataChannel(newPeerConnectionOnDataChannel(natSender, dst))
-	p.OnICECandidate(newPeerConnectionOnICECandidate(c, src, dst))
-}
-
-func initConn(conn *websocket.Conn, src string) *websocket.Conn {
-	if conn == nil {
-		connInitOnce.Do(func() {
-			conn = connectSignalingServer(signalingServer, roomID)
-			sendRegister(conn, src)
-		})
-		return conn
-	}
-	return conn
+	p.OnICECandidate(newPeerConnectionOnICECandidate(natSender.signalingServerConn, src, dst))
 }
 
 func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
@@ -514,15 +424,13 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 	} else {
 		source := &(natSender.source)
 		destination := &dst
-		natSender.signalingServerConn.conn = initConn(natSender.signalingServerConn.conn, natSender.source)
 
 		peerConnection := newPeerConnection(settingEngine, config)
 		setPeerConnection(peerConnection, natSender, source, destination)
 		var err error
 		dc, err = peerConnection.CreateDataChannel(*source, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
+		eh.ErrorHandler(err, 1, eh.LogAndFatal)
+
 		dc.OnOpen(newDataChannelOnOpen(dc, peerConnection, natSender, destination, succeeded))
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
@@ -534,27 +442,15 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 		sendOffer(offer, natSender.signalingServerConn, *source, *destination)
 		select {
 		case <-time.After(time.Second * 5):
-			log.Println("test1")
-			utils.ErrorHandler(dc.Close(), 1)
-			utils.ErrorHandler(peerConnection.Close(), 1)
+			log.Println("dial time out")
+			eh.ErrorHandler(dc.Close(), 1, eh.LogAndPanic)
+			eh.ErrorHandler(peerConnection.Close(), 1, eh.LogAndPanic)
 			close(ch)
 			natSender.setDst2SdpCh(*destination, nil)
 			return nil
 		case <-succeeded:
-			log.Printf("dc state:%d\n", dc.ReadyState())
 			return dc
 		}
-		//if <-succeeded {
-		//	log.Printf("dc state:%d\n", dc.ReadyState())
-		//	return dc
-		//} else {
-		//	log.Println("test1")
-		//	utils.ErrorHandler(dc.Close(), 1)
-		//	utils.ErrorHandler(peerConnection.Close(), 1)
-		//	close(ch)
-		//	natSender.setDst2SdpCh(*destination, nil)
-		//	return nil
-		//}
 	}
 }
 
@@ -564,10 +460,8 @@ func (natSender *NatSender) Send(dst string, data string) {
 		log.Println("destination is not online")
 		return
 	}
-	if err := dc.SendText(data); err != nil {
-		err = fmt.Errorf("NatSender.Send err when SendText: %w", err)
-		log.Println(err)
-	}
+	err := dc.SendText(data)
+	eh.ErrorHandler(err, 1, eh.LogAndPanic)
 }
 
 func (natSender *NatSender) Listen() {
@@ -577,12 +471,10 @@ func (natSender *NatSender) Listen() {
 	}
 	source := &(natSender.source)
 	destination := new(string)
-	natSender.signalingServerConn.conn = initConn(natSender.signalingServerConn.conn, natSender.source)
 
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
 	setPeerConnection(natSender.listeningPc, natSender, source, destination)
 	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
-	go natSender.sdpDispatcher()
 }
 
 func (natSender *NatSender) Accept() {
@@ -592,13 +484,10 @@ func (natSender *NatSender) Accept() {
 	// set to update listener
 	destination := new(string)
 	source := &natSender.source
-
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
 	setPeerConnection(natSender.listeningPc, natSender, source, destination)
 	natSender.listeningSdpCh = make(chan []byte)
-
 	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
-
 }
 
 func (natSender *NatSender) Close() {
