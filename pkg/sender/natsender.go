@@ -13,6 +13,7 @@ import (
 	webrtc "github.com/pion/webrtc/v3"
 	"github.com/spark4862/sender/pkg/common"
 	eh "github.com/spark4862/sender/pkg/utils/errorhandler"
+	sm "github.com/spark4862/sender/pkg/utils/safemap"
 	"log"
 	"sync"
 	"time"
@@ -84,46 +85,6 @@ func NewNatSender(source string) *NatSender {
 
 var _ Sender = &NatSender{}
 
-func (natSender *NatSender) setDst2pc(dst string, pc *webrtc.PeerConnection) {
-	natSender.dst2pcMu.Lock()
-	defer natSender.dst2pcMu.Unlock()
-	natSender.dst2pc[dst] = pc
-}
-
-func (natSender *NatSender) getDst2pc(dst string) (pc *webrtc.PeerConnection, ok bool) {
-	natSender.dst2pcMu.RLock()
-	defer natSender.dst2pcMu.RUnlock()
-	pc, ok = natSender.dst2pc[dst]
-	return
-}
-
-func (natSender *NatSender) setDst2dc(dst string, dc *webrtc.DataChannel) {
-	natSender.dst2dcMu.Lock()
-	defer natSender.dst2dcMu.Unlock()
-	natSender.dst2dc[dst] = dc
-}
-
-func (natSender *NatSender) getDst2dc(dst string) (dc *webrtc.DataChannel, ok bool) {
-	natSender.dst2dcMu.RLock()
-	defer natSender.dst2dcMu.RUnlock()
-	dc, ok = natSender.dst2dc[dst]
-	return
-}
-
-func (natSender *NatSender) setDst2SdpCh(dst string, ch chan []byte) {
-	natSender.dst2SdpChMu.Lock()
-	defer natSender.dst2SdpChMu.Unlock()
-	natSender.dst2SdpCh[dst] = ch
-	log.Printf("setDst2SdpCh %s", dst)
-}
-
-func (natSender *NatSender) getDst2SdpCh(dst string) (ch chan []byte, ok bool) {
-	natSender.dst2SdpChMu.RLock()
-	defer natSender.dst2SdpChMu.RUnlock()
-	ch, ok = natSender.dst2SdpCh[dst]
-	return
-}
-
 func (natSender *NatSender) sdpDispatcher() {
 	for {
 		_, rawMsg, err := natSender.signalingServerConn.conn.ReadMessage()
@@ -142,7 +103,7 @@ func (natSender *NatSender) sdpDispatcher() {
 		}
 
 		dst := targetedMsg.Src
-		ch, ok := natSender.getDst2SdpCh(dst)
+		ch, ok := sm.GetSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, dst)
 		if !ok {
 			natSender.listeningSdpCh <- rawMsg
 		} else {
@@ -159,14 +120,6 @@ func connectSignalingServer(pSignalingServer string, rID string) *websocket.Conn
 	log.Println("connected to signaling server")
 	return conn
 }
-
-//func closeConnection(c *websocket.Conn) {
-//	err := c.Close()
-//	if err != nil {
-//		err = fmt.Errorf("closeConnection err when Close: %w", err)
-//		log.Println(err)
-//	}
-//}
 
 func newSettingEngine(l logging.LogLevel) webrtc.SettingEngine {
 	s := webrtc.SettingEngine{}
@@ -188,8 +141,8 @@ func newPeerConnection(s webrtc.SettingEngine, cfg webrtc.Configuration) *webrtc
 
 func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, natSender *NatSender, dst *string, succeeded chan bool) func() {
 	return func() {
-		natSender.setDst2dc(*dst, dc)
-		natSender.setDst2pc(*dst, pc)
+		sm.SetSafeMap(natSender.dst2dc, &natSender.dst2SdpChMu, *dst, dc)
+		sm.SetSafeMap(natSender.dst2pc, &natSender.dst2SdpChMu, *dst, pc)
 
 		log.Println("OnOpen" + dc.Label())
 		if succeeded != nil {
@@ -221,9 +174,9 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 		log.Printf("OnDataChannel %s %d\n", dc.Label(), dc.ID())
 
 		dc.OnOpen(func() {
-			natSender.setDst2dc(*dst, dc)
-			natSender.setDst2pc(*dst, natSender.listeningPc)
-			natSender.setDst2SdpCh(*dst, natSender.listeningSdpCh)
+			sm.SetSafeMap(natSender.dst2dc, &natSender.dst2SdpChMu, *dst, dc)
+			sm.SetSafeMap(natSender.dst2pc, &natSender.dst2SdpChMu, *dst, natSender.listeningPc)
+			sm.SetSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, *dst, natSender.listeningSdpCh)
 			natSender.canAccept <- struct{}{}
 			err := dc.SendText("hello from server")
 			eh.ErrorHandler(err, 1, eh.LogAndPanic)
@@ -416,7 +369,7 @@ func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *stri
 }
 
 func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
-	dc, ok := natSender.getDst2dc(dst)
+	dc, ok := sm.GetSafeMap(natSender.dst2dc, &natSender.dst2dcMu, dst)
 	succeeded := make(chan bool)
 	defer close(succeeded)
 	if ok {
@@ -436,7 +389,7 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
 		})
 		ch := make(chan []byte)
-		natSender.setDst2SdpCh(*destination, ch)
+		sm.SetSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, *destination, ch)
 		go sdpHandler(natSender.signalingServerConn, ch, peerConnection, source, destination, true)
 		offer := newAndSetOffer(peerConnection)
 		sendOffer(offer, natSender.signalingServerConn, *source, *destination)
@@ -446,7 +399,7 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 			eh.ErrorHandler(dc.Close(), 1, eh.LogAndPanic)
 			eh.ErrorHandler(peerConnection.Close(), 1, eh.LogAndPanic)
 			close(ch)
-			natSender.setDst2SdpCh(*destination, nil)
+			sm.DeleteSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, *destination)
 			return nil
 		case <-succeeded:
 			return dc
