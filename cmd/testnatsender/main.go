@@ -32,18 +32,38 @@ func main() {
 		natSender.Listen()
 		go func() {
 			for {
+				select {
+				case <-natSender.Ctx.Done():
+					return
+				default:
+				}
 				natSender.Accept()
 			}
 		}()
 	}
 
 	if isSender {
-		for {
-			natSender.Send(*destination, "hello")
-			time.Sleep(3 * time.Second)
-		}
+		go func() {
+			for {
+				natSender.Send(*destination, "hello")
+				select {
+				case <-natSender.Ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+				}
+			}
+		}()
 	}
-	select {}
+	var t time.Duration
+	if isSender {
+		t = 10
+	} else {
+		t = 20
+	}
+	<-time.After(t * time.Second)
+	natSender.Close()
+	return
+	//select {}
 }
 
 // go run . -src c1

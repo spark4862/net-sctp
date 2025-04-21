@@ -6,6 +6,7 @@
 package sender
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -36,15 +37,22 @@ var (
 
 // 注意，由于包含了writeMu, 只能以指针传递，不能以值传递，因为sync.Mutex 是一个值类型，但它不应该被复制
 type connWithMu struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn *websocket.Conn
+	mu   sync.Mutex
 }
 
 func (c *connWithMu) writeJSON(v interface{}) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	err := c.conn.WriteJSON(v)
 	eh.ErrorHandler(err, 2, eh.LogAndPanic)
+}
+
+func (c *connWithMu) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.conn.Close()
+	eh.ErrorHandler(err, 2, eh.LogOnly)
 }
 
 type NatSender struct {
@@ -63,9 +71,13 @@ type NatSender struct {
 	// 用锁来保护多协程写，用chan确保单协程读
 	signalingServerConn *connWithMu
 	source              string
+
+	Ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewNatSender(source string) *NatSender {
+	ctx, cancel := context.WithCancel(context.Background())
 	ns := &NatSender{
 		dst2dc:         make(map[string]*webrtc.DataChannel),
 		dst2pc:         make(map[string]*webrtc.PeerConnection),
@@ -77,16 +89,20 @@ func NewNatSender(source string) *NatSender {
 			conn: connectSignalingServer(signalingServer, roomID),
 		},
 		source: source,
+		Ctx:    ctx,
+		cancel: cancel,
 	}
 	sendRegister(ns.signalingServerConn.conn, source)
-	go ns.sdpDispatcher()
+	go ns.sdpDispatcher(ctx)
 	return ns
 }
 
 var _ Sender = &NatSender{}
 
-func (natSender *NatSender) sdpDispatcher() {
+func (natSender *NatSender) sdpDispatcher(ctx context.Context) {
 	for {
+		// 当natSender关闭的时候，应当关闭conn,这样ReadMessage就不会阻塞
+		// 正常情况下就是从此处退出
 		_, rawMsg, err := natSender.signalingServerConn.conn.ReadMessage()
 		if eh.ErrorHandler(err, 1, eh.LogOnly) {
 			return
@@ -105,9 +121,14 @@ func (natSender *NatSender) sdpDispatcher() {
 		dst := targetedMsg.Src
 		ch, ok := sm.GetSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, dst)
 		if !ok {
-			natSender.listeningSdpCh <- rawMsg
-		} else {
-			ch <- rawMsg
+			ch = natSender.listeningSdpCh
+		}
+		select {
+		case <-ctx.Done():
+			// 通过ctx退出
+			// 此处若阻塞说明sdpHandler先退出
+			return
+		case ch <- rawMsg:
 		}
 	}
 }
@@ -213,109 +234,115 @@ func newPeerConnectionOnICECandidate(c *connWithMu, src *string, dst *string) fu
 
 // 该函数用于创建goroutine后没有退出，是为了可能存在的连接建立后交换消息的情况，目前不清楚需不需要在连接建立后退出
 // 搞了一个停止信号，但不知道对不对，因为有个disconnected状态，会不会用指数等待的sleep会更好
-func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *string, dst *string, isClient bool) {
+func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *string, dst *string, isClient bool, ctx context.Context) {
 	for {
-		// 阻塞，所以不需要停止go sdpHandler
-		// 但会有协程泄漏问题
-		rawMsg := <-ch
+		select {
+		case <-ctx.Done():
+			return
+		case rawMsg, ok := <-ch:
+			// 按道理应该sdpHandler先退出再关闭ch
+			if !ok {
+				return
+			}
 
-		var msg common.SignalMsg
-		err := json.Unmarshal(rawMsg, &msg)
-		if eh.ErrorHandler(err, 1, eh.LogOnly) {
-			continue
-		}
+			var msg common.SignalMsg
+			err := json.Unmarshal(rawMsg, &msg)
+			if eh.ErrorHandler(err, 1, eh.LogOnly) {
+				continue
+			}
 
-		switch msg.Type {
-		case common.Answer:
-			if isClient {
-				log.Println("recv a answer msg")
+			switch msg.Type {
+			case common.Answer:
+				if isClient {
+					log.Println("recv a answer msg")
+					fromTargetedMsg := common.TargetedMsg{}
+					if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+					answer := webrtc.SessionDescription{}
+					if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					if err := p.SetRemoteDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					log.Println("set remote desc for answer ok")
+				} else {
+					log.Println(fmt.Errorf("sdpHandler err: should never receive answer"))
+					continue
+				}
+			case common.Offer:
+				if isClient {
+					log.Println(fmt.Errorf("sdpHandler err: should never receive offer"))
+					continue
+				} else {
+					log.Println("recv a offer msg")
+					fromTargetedMsg := common.TargetedMsg{}
+					if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+					*dst = fromTargetedMsg.Src
+
+					offer := webrtc.SessionDescription{}
+					if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					if err := p.SetRemoteDescription(offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					answer, err := p.CreateAnswer(nil)
+					if eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					if err := p.SetLocalDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					answerString, err := json.Marshal(answer)
+					if eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					toTargetedMsg := common.TargetedMsg{
+						Src:  *src,
+						Dst:  *dst,
+						Data: string(answerString),
+					}
+					targetedString, err := json.Marshal(toTargetedMsg)
+					if eh.ErrorHandler(err, 1, eh.LogOnly) {
+						continue
+					}
+
+					c.writeJSON(&common.SignalMsg{
+						Type: common.Answer,
+						Data: string(targetedString),
+					})
+					log.Println("send answer ok")
+				}
+			case common.Candidate:
 				fromTargetedMsg := common.TargetedMsg{}
 				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
-				answer := webrtc.SessionDescription{}
-				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+
+				candidate := webrtc.ICECandidateInit{}
+				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
-				if err := p.SetRemoteDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
+				if err := p.AddICECandidate(candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
 					continue
 				}
 
-				log.Println("set remote desc for answer ok")
-			} else {
-				log.Println(fmt.Errorf("sdpHandler err: should never receive answer"))
-				continue
+				log.Println("add ice candidate:", candidate)
+			default:
+				panic("unhandled default case")
 			}
-		case common.Offer:
-			if isClient {
-				log.Println(fmt.Errorf("sdpHandler err: should never receive offer"))
-				continue
-			} else {
-				log.Println("recv a offer msg")
-				fromTargetedMsg := common.TargetedMsg{}
-				if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-				*dst = fromTargetedMsg.Src
-
-				offer := webrtc.SessionDescription{}
-				if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				if err := p.SetRemoteDescription(offer); eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				answer, err := p.CreateAnswer(nil)
-				if eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				if err := p.SetLocalDescription(answer); eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				answerString, err := json.Marshal(answer)
-				if eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				toTargetedMsg := common.TargetedMsg{
-					Src:  *src,
-					Dst:  *dst,
-					Data: string(answerString),
-				}
-				targetedString, err := json.Marshal(toTargetedMsg)
-				if eh.ErrorHandler(err, 1, eh.LogOnly) {
-					continue
-				}
-
-				c.writeJSON(&common.SignalMsg{
-					Type: common.Answer,
-					Data: string(targetedString),
-				})
-				log.Println("send answer ok")
-			}
-		case common.Candidate:
-			fromTargetedMsg := common.TargetedMsg{}
-			if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
-				continue
-			}
-
-			candidate := webrtc.ICECandidateInit{}
-			if err := json.Unmarshal([]byte(fromTargetedMsg.Data), &candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
-				continue
-			}
-
-			if err := p.AddICECandidate(candidate); eh.ErrorHandler(err, 1, eh.LogOnly) {
-				continue
-			}
-
-			log.Println("add ice candidate:", candidate)
-		default:
-			panic("unhandled default case")
 		}
 	}
 }
@@ -390,7 +417,7 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 		})
 		ch := make(chan []byte)
 		sm.SetSafeMap(natSender.dst2SdpCh, &natSender.dst2SdpChMu, *destination, ch)
-		go sdpHandler(natSender.signalingServerConn, ch, peerConnection, source, destination, true)
+		go sdpHandler(natSender.signalingServerConn, ch, peerConnection, source, destination, true, natSender.Ctx)
 		offer := newAndSetOffer(peerConnection)
 		sendOffer(offer, natSender.signalingServerConn, *source, *destination)
 		select {
@@ -427,11 +454,14 @@ func (natSender *NatSender) Listen() {
 
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
 	setPeerConnection(natSender.listeningPc, natSender, source, destination)
-	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
+	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false, natSender.Ctx)
 }
 
 func (natSender *NatSender) Accept() {
-	<-natSender.canAccept
+	select {
+	case <-natSender.Ctx.Done():
+	case <-natSender.canAccept:
+	}
 	log.Println("start accept")
 	natSender.listeningPc = nil
 	// set to update listener
@@ -440,9 +470,26 @@ func (natSender *NatSender) Accept() {
 	natSender.listeningPc = newPeerConnection(settingEngine, config)
 	setPeerConnection(natSender.listeningPc, natSender, source, destination)
 	natSender.listeningSdpCh = make(chan []byte)
-	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false)
+	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false, natSender.Ctx)
 }
 
 func (natSender *NatSender) Close() {
-
+	natSender.signalingServerConn.close()
+	natSender.cancel()
+	// 等待协程退出
+	time.Sleep(100 * time.Millisecond)
+	if natSender.listeningPc != nil {
+		eh.ErrorHandler(natSender.listeningPc.Close(), 1, eh.LogOnly)
+	}
+	close(natSender.listeningSdpCh)
+	close(natSender.canAccept)
+	for _, pc := range natSender.dst2pc {
+		eh.ErrorHandler(pc.Close(), 1, eh.LogOnly)
+	}
+	for _, dc := range natSender.dst2dc {
+		eh.ErrorHandler(dc.Close(), 1, eh.LogOnly)
+	}
+	for _, ch := range natSender.dst2SdpCh {
+		close(ch)
+	}
 }
