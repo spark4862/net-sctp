@@ -25,9 +25,7 @@ func init() {
 
 func main() {
 	natSender := sender.NewNatSender(*source)
-	// 实现有点问题，应该吧
 
-	// 把dispatcher放到listen里面了，必须执行Listen
 	if !isSender {
 		natSender.Listen()
 		go func() {
@@ -49,18 +47,22 @@ func main() {
 				select {
 				case <-natSender.Ctx.Done():
 					return
-				case <-time.After(3 * time.Second):
+				default:
 				}
 			}
 		}()
 	}
 	var t time.Duration
 	if isSender {
-		t = 10
-	} else {
 		t = 20
+	} else {
+		t = 10
 	}
 	<-time.After(t * time.Second)
+	//if !isSender {
+	//	a, _ := natSender.Dst2pc.Get(*destination)
+	//	a.Close()
+	//}
 	natSender.Close()
 	return
 	//select {}

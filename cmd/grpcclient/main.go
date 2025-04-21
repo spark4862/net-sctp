@@ -174,14 +174,14 @@ func messageHandler(c *websocket.Conn, p *webrtc.PeerConnection, src *string, ds
 	for {
 		// 阻塞，所以不需要停止go messageHandler
 		_, rawMsg, err := c.ReadMessage()
-		if errorhandler.ErrorHandler(err, 1) {
+		if errorhandler.ErrorHandler(err, 1, errorhandler.LogOnly) {
 			return
 		}
 		log.Println("recv msg from signaling server")
 
 		var msg common.SignalMsg
 		err = json.Unmarshal(rawMsg, &msg)
-		if errorhandler.ErrorHandler(err, 1) {
+		if errorhandler.ErrorHandler(err, 1, errorhandler.LogOnly) {
 			continue
 		}
 
