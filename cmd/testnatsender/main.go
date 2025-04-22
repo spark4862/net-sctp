@@ -11,6 +11,7 @@ var (
 	source      *string = new(string)
 	isSender    bool
 	isListener  bool
+	liveTime    int
 )
 
 func parse() {
@@ -18,6 +19,7 @@ func parse() {
 	flag.StringVar(destination, "dst", "c2", "name to call")
 	flag.BoolVar(&isSender, "isSender", false, "is sender")
 	flag.BoolVar(&isListener, "isListener", false, "is listener")
+	flag.IntVar(&liveTime, "t", 500000, "live time")
 	flag.Parse()
 }
 
@@ -45,26 +47,20 @@ func main() {
 	if isSender {
 		go func() {
 			for {
-				natSender.Send(*destination, "hello")
+				natSender.Send(*destination, []byte("hello"))
 				select {
 				case <-natSender.Ctx.Done():
 					return
-				default:
+				case <-time.After(2 * time.Second):
 				}
 			}
 		}()
 	}
-	var t time.Duration
-	if isSender {
-		t = 20
-	} else {
-		t = 30
-	}
-	<-time.After(t * time.Second)
+	<-time.After(time.Duration(liveTime) * time.Second)
 	natSender.Close()
 	return
 	//select {}
 }
 
-// go run . -src c1
-// ./testnatsender -src c2 -dst c1 -isSender
+// go run . -src c1 -isListener -t 20
+// ./testnatsender -src c2 -dst c1 -isSender -t 20

@@ -1,6 +1,7 @@
 // todo: 目前还有个bug,如果两方同时dial对方，可能会丢失一个datachannel，如果存在较远的先后关系，不会有这个问题
-// todo: webrtc的datachannel在connected可能变为disconnecting,应该在disconnecting后回收资源，防止再次connected后造成连接状态问题
 // todo: 资源回收过程可能不规范，有多余报错
+// remained: 断点续接可能存在短时间不应期（state 变为 disconnected前）
+// todo: 多机验证
 
 package sender
 
@@ -83,12 +84,13 @@ type NatSender struct {
 func NewNatSender(source string) *NatSender {
 	ctx, cancel := context.WithCancel(context.Background())
 	ns := &NatSender{
-		Dst2dc:         sm.NewSafeMap[string, *webrtc.DataChannel](),
-		Dst2pc:         sm.NewSafeMap[string, *webrtc.PeerConnection](),
-		Dst2SdpCh:      sm.NewSafeMap[string, chan []byte](),
-		listeningSdpCh: make(chan []byte),
-		listeningPc:    nil,
-		canAccept:      make(chan struct{}),
+		Dst2dc:             sm.NewSafeMap[string, *webrtc.DataChannel](),
+		Dst2pc:             sm.NewSafeMap[string, *webrtc.PeerConnection](),
+		Dst2SdpCh:          sm.NewSafeMap[string, chan []byte](),
+		Dst2ConnectionType: sm.NewSafeMap[string, string](),
+		listeningSdpCh:     make(chan []byte),
+		listeningPc:        nil,
+		canAccept:          make(chan struct{}),
 		signalingServerConn: &connWithMu{
 			conn: connectSignalingServer(signalingServer, roomID),
 		},
@@ -189,25 +191,29 @@ func newPeerConnectionOnConnectionStateChange(p *webrtc.PeerConnection, natSende
 	// todo: closed failed的时候应该如何处理？
 	return func(s webrtc.PeerConnectionState) {
 		log.Printf("OnConnectionStateChange: %s\n", s.String())
-		if s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
-			cancel, _ := natSender.dst2cancel.Get(*dst)
-			//if !ok {
-			//	// 防止资源重复释放
-			//	// 应该不会重复释放，因为pc和dc都closed了
-			//	return
-			//}
+		// 该部分应该作为网络连接波动时或连接无法建立时的资源回收
+		// 在natSender操控peerConnection.close的接口的时候，不需要加上webrtc.PeerConnectionStateClosed
+		// 因为在此情况下pc.close被调用，说明ns.close被调用，资源已经清理
+		if s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed {
+			cancel, ok := natSender.dst2cancel.Get(*dst)
+			if !ok {
+				// 防止资源重复释放
+				log.Println("cancel is called more than once")
+				return
+			}
 			cancel()
 			time.Sleep(100 * time.Millisecond)
 			pc, _ := natSender.Dst2pc.Get(*dst)
 			dc, _ := natSender.Dst2dc.Get(*dst)
 			ch, _ := natSender.Dst2SdpCh.Get(*dst)
-			eh.ErrorHandler(pc.Close(), 1, eh.LogOnly)
 			eh.ErrorHandler(dc.Close(), 1, eh.LogOnly)
+			eh.ErrorHandler(pc.Close(), 1, eh.LogOnly)
 			close(ch)
 			natSender.dst2cancel.Del(*dst)
 			natSender.Dst2dc.Del(*dst)
 			natSender.Dst2SdpCh.Del(*dst)
 			natSender.Dst2pc.Del(*dst)
+			natSender.Dst2ConnectionType.Del(*dst)
 		}
 		if s == webrtc.PeerConnectionStateConnected {
 			stats := p.GetStats()
@@ -251,7 +257,10 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 			log.Printf("OnOpen '%s'-'%d'\n", dc.Label(), dc.ID())
 		})
 
-		dc.OnClose(func() { log.Println("my dc closed") })
+		dc.OnClose(func() {
+			// 应该不会单独处理这个，外部不应该手动调用dc的close函数，也不应该看到dc的抽象，应该有peerConnection
+			log.Println("listening dc closed with state " + dc.ReadyState().String())
+		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
@@ -465,7 +474,9 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
 		})
 
-		dc.OnClose(func() { log.Println("peer dc closed") })
+		dc.OnClose(func() {
+			log.Println("sender dc closed with state " + dc.ReadyState().String())
+		})
 
 		ch := make(chan []byte)
 		natSender.Dst2SdpCh.Set(*destination, ch)
@@ -491,13 +502,13 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 	}
 }
 
-func (natSender *NatSender) Send(dst string, data string) {
+func (natSender *NatSender) Send(dst string, data []byte) {
 	dc := natSender.dial(dst)
-	if dc == nil {
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		log.Println("destination is not online")
 		return
 	}
-	eh.ErrorHandler(dc.SendText(data), 1, eh.LogAndPanic)
+	eh.ErrorHandler(dc.Send(data), 1, eh.LogAndPanic)
 }
 
 func (natSender *NatSender) Listen() {
@@ -537,18 +548,19 @@ func (natSender *NatSender) Close() {
 	natSender.signalingServerConn.close()
 	natSender.cancel()
 	// 等待协程退出
+	// 或者用waitGroup？
 	time.Sleep(100 * time.Millisecond)
+	for _, dc := range natSender.Dst2dc.M {
+		eh.ErrorHandler(dc.Close(), 1, eh.LogOnly)
+	}
+	for _, pc := range natSender.Dst2pc.M {
+		eh.ErrorHandler(pc.Close(), 1, eh.LogOnly)
+	}
 	if natSender.listeningPc != nil {
 		eh.ErrorHandler(natSender.listeningPc.Close(), 1, eh.LogOnly)
 	}
 	close(natSender.listeningSdpCh)
 	close(natSender.canAccept)
-	for _, pc := range natSender.Dst2pc.M {
-		eh.ErrorHandler(pc.Close(), 1, eh.LogOnly)
-	}
-	for _, dc := range natSender.Dst2dc.M {
-		eh.ErrorHandler(dc.Close(), 1, eh.LogOnly)
-	}
 	for _, ch := range natSender.Dst2SdpCh.M {
 		close(ch)
 	}
