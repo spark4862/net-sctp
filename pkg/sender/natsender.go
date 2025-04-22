@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/pion/logging"
-	webrtc "github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v3"
 	"github.com/spark4862/sender/pkg/common"
 	eh "github.com/spark4862/sender/pkg/utils/errorhandler"
 	sm "github.com/spark4862/sender/pkg/utils/safemap"
@@ -20,9 +20,9 @@ import (
 )
 
 var (
-	signalingServer string               = "ws://8.153.200.135:28080/ws"
-	roomID          string               = "default"
-	config          webrtc.Configuration = webrtc.Configuration{
+	signalingServer = "ws://8.153.200.135:28080/ws"
+	roomID          = "default"
+	config          = webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
 				URLs:       []string{"turn:8.153.200.135:3479"},
@@ -31,7 +31,7 @@ var (
 			},
 		},
 	}
-	settingEngine webrtc.SettingEngine = newSettingEngine(logging.LogLevelWarn)
+	settingEngine = newSettingEngine(logging.LogLevelWarn)
 )
 
 // 注意，由于包含了writeMu, 只能以指针传递，不能以值传递，因为sync.Mutex 是一个值类型，但它不应该被复制
@@ -72,6 +72,8 @@ type NatSender struct {
 	source string
 	// 用于同步和资源释放
 	Ctx context.Context
+
+	Dst2ConnectionType *sm.SafeMap[string, string]
 	// 用于细零度资源释放
 	//dst2ctx *sm.SafeMap[string, context.Context]
 	dst2cancel *sm.SafeMap[string, context.CancelFunc]
@@ -182,17 +184,18 @@ func newPeerConnectionOnICEConnectionStateChange() func(connectionState webrtc.I
 	}
 }
 
-func newPeerConnectionOnConnectionStateChange(natSender *NatSender, dst *string) func(s webrtc.PeerConnectionState) {
+func newPeerConnectionOnConnectionStateChange(p *webrtc.PeerConnection, natSender *NatSender, dst *string) func(s webrtc.PeerConnectionState) {
 	// todo: 此处应该添加对disconnected的处理
 	// todo: closed failed的时候应该如何处理？
 	return func(s webrtc.PeerConnectionState) {
 		log.Printf("OnConnectionStateChange: %s\n", s.String())
 		if s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
-			cancel, ok := natSender.dst2cancel.Get(*dst)
-			if !ok {
-				// 防止资源重复释放
-				return
-			}
+			cancel, _ := natSender.dst2cancel.Get(*dst)
+			//if !ok {
+			//	// 防止资源重复释放
+			//	// 应该不会重复释放，因为pc和dc都closed了
+			//	return
+			//}
 			cancel()
 			time.Sleep(100 * time.Millisecond)
 			pc, _ := natSender.Dst2pc.Get(*dst)
@@ -205,6 +208,24 @@ func newPeerConnectionOnConnectionStateChange(natSender *NatSender, dst *string)
 			natSender.Dst2dc.Del(*dst)
 			natSender.Dst2SdpCh.Del(*dst)
 			natSender.Dst2pc.Del(*dst)
+		}
+		if s == webrtc.PeerConnectionStateConnected {
+			stats := p.GetStats()
+			var candidateId string
+			for _, report := range stats {
+				r, ok := report.(webrtc.ICECandidatePairStats)
+				if ok && r.Type == webrtc.StatsTypeCandidatePair && r.Nominated {
+					candidateId = r.LocalCandidateID
+				}
+			}
+			for _, report := range stats {
+				r, ok := report.(webrtc.ICECandidateStats)
+				if ok && r.ID == candidateId {
+					t := r.CandidateType.String()
+					natSender.Dst2ConnectionType.Set(*dst, t)
+					log.Printf("connectionType %s \n", t)
+				}
+			}
 		}
 	}
 }
@@ -282,7 +303,7 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 			switch msg.Type {
 			case common.Answer:
 				if isClient {
-					log.Println("recv a answer msg")
+					log.Println("rev a answer msg")
 					fromTargetedMsg := common.TargetedMsg{}
 					if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 						continue
@@ -306,7 +327,7 @@ func sdpHandler(c *connWithMu, ch chan []byte, p *webrtc.PeerConnection, src *st
 					log.Println(fmt.Errorf("sdpHandler err: should never receive offer"))
 					continue
 				} else {
-					log.Println("recv a offer msg")
+					log.Println("rev a offer msg")
 					fromTargetedMsg := common.TargetedMsg{}
 					if err := json.Unmarshal([]byte(msg.Data), &fromTargetedMsg); eh.ErrorHandler(err, 1, eh.LogOnly) {
 						continue
@@ -417,7 +438,7 @@ func sendOffer(o webrtc.SessionDescription, c *connWithMu, src string, dst strin
 
 func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *string, dst *string) {
 	p.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
-	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange(natSender, dst))
+	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange(p, natSender, dst))
 	p.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
 	p.OnDataChannel(newPeerConnectionOnDataChannel(natSender, dst))
 	p.OnICECandidate(newPeerConnectionOnICECandidate(natSender.signalingServerConn, src, dst))
@@ -534,6 +555,12 @@ func (natSender *NatSender) Close() {
 	// cancel自动回收
 }
 
+func (natSender *NatSender) GetConnectionType(dst string) (typeString string, ok bool) {
+	natSender.dial(dst)
+	typeString, ok = natSender.Dst2ConnectionType.Get(dst)
+	return
+}
+
 // todo:
 // dc.Close会关闭本端和对端的dc,触发onclose
-// pc.Close会先关闭dc和pc,在把connectionstate设置为closed
+// pc.Close会先关闭dc和pc,在把connectionState设置为closed

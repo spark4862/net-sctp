@@ -10,12 +10,14 @@ var (
 	destination *string = new(string)
 	source      *string = new(string)
 	isSender    bool
+	isListener  bool
 )
 
 func parse() {
 	flag.StringVar(source, "src", "c1", "name to register")
 	flag.StringVar(destination, "dst", "c2", "name to call")
 	flag.BoolVar(&isSender, "isSender", false, "is sender")
+	flag.BoolVar(&isListener, "isListener", false, "is listener")
 	flag.Parse()
 }
 
@@ -26,7 +28,7 @@ func init() {
 func main() {
 	natSender := sender.NewNatSender(*source)
 
-	if !isSender {
+	if isListener {
 		natSender.Listen()
 		go func() {
 			for {
@@ -56,13 +58,9 @@ func main() {
 	if isSender {
 		t = 20
 	} else {
-		t = 10
+		t = 30
 	}
 	<-time.After(t * time.Second)
-	//if !isSender {
-	//	a, _ := natSender.Dst2pc.Get(*destination)
-	//	a.Close()
-	//}
 	natSender.Close()
 	return
 	//select {}
