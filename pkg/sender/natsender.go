@@ -21,18 +21,16 @@ import (
 )
 
 var (
-	signalingServer = "ws://8.153.200.135:28080/ws"
-	roomID          = "default"
-	config          = webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs:       []string{"turn:8.153.200.135:3479"},
-				Username:   "test1",
-				Credential: "123456",
-			},
-		},
-	}
-	settingEngine = newSettingEngine(logging.LogLevelWarn)
+	roomID = "default"
+	//config = webrtc.Configuration{
+	//	ICEServers: []webrtc.ICEServer{
+	//		{
+	//			URLs:       []string{"turn:8.153.200.135:3479"},
+	//			Username:   "test1",
+	//			Credential: "123456",
+	//		},
+	//	},
+	//}
 )
 
 // 注意，由于包含了writeMu, 只能以指针传递，不能以值传递，因为sync.Mutex 是一个值类型，但它不应该被复制
@@ -69,19 +67,23 @@ type NatSender struct {
 	canAccept chan struct{}
 	// 用锁来保护多协程写，用chan确保单协程读
 	signalingServerConn *connWithMu
-
+	// 监听id
 	source string
-	// 用于同步和资源释放
-	Ctx context.Context
 
 	Dst2ConnectionType *sm.SafeMap[string, string]
+	// 用于同步和资源释放
+	Ctx    context.Context
+	cancel context.CancelFunc
 	// 用于细零度资源释放
-	//dst2ctx *sm.SafeMap[string, context.Context]
 	dst2cancel *sm.SafeMap[string, context.CancelFunc]
-	cancel     context.CancelFunc
+	// 消息接收时的回调函数
+	onMessage func(msg []byte)
+	// used to init webrtc api
+	settingEngine webrtc.SettingEngine
+	webrtcConfig  webrtc.Configuration
 }
 
-func NewNatSender(source string) *NatSender {
+func NewNatSender(source string, signalingServer string, onMessage func(msg []byte), logLevel logging.LogLevel) *NatSender {
 	ctx, cancel := context.WithCancel(context.Background())
 	ns := &NatSender{
 		Dst2dc:             sm.NewSafeMap[string, *webrtc.DataChannel](),
@@ -94,11 +96,21 @@ func NewNatSender(source string) *NatSender {
 		signalingServerConn: &connWithMu{
 			conn: connectSignalingServer(signalingServer, roomID),
 		},
-		source: source,
-		Ctx:    ctx,
-		//dst2ctx: sm.NewSafeMap[string, context.Context](),
-		dst2cancel: sm.NewSafeMap[string, context.CancelFunc](),
-		cancel:     cancel,
+		source:        source,
+		Ctx:           ctx,
+		dst2cancel:    sm.NewSafeMap[string, context.CancelFunc](),
+		cancel:        cancel,
+		onMessage:     onMessage,
+		settingEngine: newSettingEngine(logLevel),
+		webrtcConfig: webrtc.Configuration{
+			ICEServers: []webrtc.ICEServer{
+				{
+					URLs:       []string{"turn:8.153.200.135:3479"},
+					Username:   "test1",
+					Credential: "123456",
+				},
+			},
+		},
 	}
 	sendRegister(ns.signalingServerConn.conn, source)
 	go ns.sdpDispatcher(ctx)
@@ -173,7 +185,7 @@ func newDataChannelOnOpen(dc *webrtc.DataChannel, pc *webrtc.PeerConnection, nat
 		natSender.Dst2dc.Set(*dst, dc)
 		natSender.Dst2pc.Set(*dst, pc)
 
-		log.Println("OnOpen" + dc.Label())
+		log.Printf("dc to %s is Open\n" + *dst)
 		if succeeded != nil {
 			succeeded <- true
 		}
@@ -187,8 +199,6 @@ func newPeerConnectionOnICEConnectionStateChange() func(connectionState webrtc.I
 }
 
 func newPeerConnectionOnConnectionStateChange(p *webrtc.PeerConnection, natSender *NatSender, dst *string) func(s webrtc.PeerConnectionState) {
-	// todo: 此处应该添加对disconnected的处理
-	// todo: closed failed的时候应该如何处理？
 	return func(s webrtc.PeerConnectionState) {
 		log.Printf("OnConnectionStateChange: %s\n", s.String())
 		// 该部分应该作为网络连接波动时或连接无法建立时的资源回收
@@ -242,9 +252,8 @@ func newPeerConnectionOnSignalingStateChange() func(s webrtc.SignalingState) {
 	}
 }
 
-func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*webrtc.DataChannel) {
+func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string, f func(msg []byte)) func(*webrtc.DataChannel) {
 	return func(dc *webrtc.DataChannel) {
-		log.Printf("OnDataChannel %s %d\n", dc.Label(), dc.ID())
 
 		dc.OnOpen(func() {
 			natSender.Dst2dc.Set(*dst, dc)
@@ -254,7 +263,7 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 			natSender.canAccept <- struct{}{}
 			err := dc.SendText("hello from server")
 			eh.ErrorHandler(err, 1, eh.LogAndPanic)
-			log.Printf("OnOpen '%s'-'%d'\n", dc.Label(), dc.ID())
+			log.Printf("dc to %s is open, id is %d\n", *dst, dc.ID())
 		})
 
 		dc.OnClose(func() {
@@ -263,7 +272,8 @@ func newPeerConnectionOnDataChannel(natSender *NatSender, dst *string) func(*web
 		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
+			log.Printf("OnMessage '%s':", *dst)
+			f(msg.Data)
 		})
 	}
 }
@@ -445,11 +455,11 @@ func sendOffer(o webrtc.SessionDescription, c *connWithMu, src string, dst strin
 	log.Println("send offer to signaling server ok")
 }
 
-func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *string, dst *string) {
+func setPeerConnection(p *webrtc.PeerConnection, natSender *NatSender, src *string, dst *string, f func(msg []byte)) {
 	p.OnICEConnectionStateChange(newPeerConnectionOnICEConnectionStateChange())
 	p.OnConnectionStateChange(newPeerConnectionOnConnectionStateChange(p, natSender, dst))
 	p.OnSignalingStateChange(newPeerConnectionOnSignalingStateChange())
-	p.OnDataChannel(newPeerConnectionOnDataChannel(natSender, dst))
+	p.OnDataChannel(newPeerConnectionOnDataChannel(natSender, dst, f))
 	p.OnICECandidate(newPeerConnectionOnICECandidate(natSender.signalingServerConn, src, dst))
 }
 
@@ -463,15 +473,16 @@ func (natSender *NatSender) dial(dst string) *webrtc.DataChannel {
 		source := &(natSender.source)
 		destination := &dst
 
-		peerConnection := newPeerConnection(settingEngine, config)
-		setPeerConnection(peerConnection, natSender, source, destination)
+		peerConnection := newPeerConnection(natSender.settingEngine, natSender.webrtcConfig)
+		setPeerConnection(peerConnection, natSender, source, destination, natSender.onMessage)
 		var err error
 		dc, err = peerConnection.CreateDataChannel(*source, nil)
 		eh.ErrorHandler(err, 1, eh.LogAndFatal)
 
 		dc.OnOpen(newDataChannelOnOpen(dc, peerConnection, natSender, destination, succeeded))
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("OnMessage '%s': '%s'\n", dc.Label(), string(msg.Data))
+			log.Printf("OnMessage '%s':", dst)
+			natSender.onMessage(msg.Data)
 		})
 
 		dc.OnClose(func() {
@@ -519,8 +530,8 @@ func (natSender *NatSender) Listen() {
 	source := &(natSender.source)
 	destination := new(string)
 
-	natSender.listeningPc = newPeerConnection(settingEngine, config)
-	setPeerConnection(natSender.listeningPc, natSender, source, destination)
+	natSender.listeningPc = newPeerConnection(natSender.settingEngine, natSender.webrtcConfig)
+	setPeerConnection(natSender.listeningPc, natSender, source, destination, natSender.onMessage)
 	ctx, cancel := context.WithCancel(natSender.Ctx)
 	natSender.listeningCancel = cancel
 	go sdpHandler(natSender.signalingServerConn, natSender.listeningSdpCh, natSender.listeningPc, source, destination, false, ctx)
@@ -536,8 +547,8 @@ func (natSender *NatSender) Accept() {
 	// set to update listener
 	destination := new(string)
 	source := &natSender.source
-	natSender.listeningPc = newPeerConnection(settingEngine, config)
-	setPeerConnection(natSender.listeningPc, natSender, source, destination)
+	natSender.listeningPc = newPeerConnection(natSender.settingEngine, natSender.webrtcConfig)
+	setPeerConnection(natSender.listeningPc, natSender, source, destination, natSender.onMessage)
 	natSender.listeningSdpCh = make(chan []byte)
 	ctx, cancel := context.WithCancel(natSender.Ctx)
 	natSender.listeningCancel = cancel
