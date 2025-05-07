@@ -1,23 +1,50 @@
-room 抽象
+[TOC]
 
-grpc服务器将服务名作为room名，注册到room中
-有点问题，要注册服务名的话需要该grpc部分，但是工作量有点大部分，那就没办法了，直接用ip地址吧
-那现在这个room没什么用，不过先放到这里吧，确定不需要再改
+# api 介绍
+```
+type Sender interface {
+    // 向dst发送数据，底层需要先与dst建立连接
+    Send(dst string, data []byte)
+    // 启动连接监听，若send的对端未启动监听，无法建立连接
+    Listen()
+    // 同步函数，接受连接发起者的连接
+    Accept()
+    // 获取当前连接到dst的连接类型
+    GetConnectionType(dst string) (typeString string, ok bool)
+}
 
-room保存服务器ip列表（或其他标识符）
+func NewNatSender(source string, signalingServer string, onMessage func(msg []byte), logLevel logging.LogLevel) *NatSender
+// 建立一个新的Sender，可以用于监听连接和发送数据，source为当前Sender连接标识 signalServer为连接的signaling服务器地址 onMessage为收到消息的回调函数 logLevel为日志级别
+```
 
-grpc客户端依据请求的服务名加入，room获取ip列表
-grpc客户端选择一个ip，希望与此服务器建立连接，若失败选择下一个
 
-目前没做服务刷新和心跳保持
-
-要不要搞个注册中心？
-没让我搞，什么架构我也不清楚，先搞了demo吧
-服务端：在net.listener中加个goroutine，用来保持和signal的连接
-客户端：同上
-
-用ip注册的问题：没有实际的寻址过程，若有多个源ip，无法通过路由等方式确定使用那个ip发送
-
-那就只能用其他标识了，但不知道能用什么
-
-以下代码假设grpc-client grpc-server加入时会注册自己的唯一标识
+# 用法介绍
+```
+// 初始化sender
+natSender := sender.NewNatSender(*source, *signalingServer, func(msg []byte) { log.Print(string(msg)) }, logging.LogLevelWarn)
+// 监听并接受连接
+natSender.Listen()
+go func() {
+	for {
+		select {
+		case <-natSender.Ctx.Done():
+			return
+		default:
+		}
+		natSender.Accept()
+	}
+}()=
+// 向对端发送数据
+go func() {
+	for {
+		for _, dst := range dsts {
+			natSender.Send(dst, []byte("hello"))
+		}
+		select {
+		case <-natSender.Ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}()
+```

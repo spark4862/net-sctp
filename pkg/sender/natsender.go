@@ -1,7 +1,7 @@
 // todo: 目前还有个bug,如果两方同时dial对方，可能会丢失一个datachannel，如果存在较远的先后关系，不会有这个问题
 // todo: 资源回收过程可能不规范，有多余报错
 // remained: 断点续接可能存在短时间不应期（state 变为 disconnected前）
-// todo: 多机验证
+// todo: waitGroup会不会比time.After好，在等待关闭的时候
 
 package sender
 
@@ -238,8 +238,10 @@ func newPeerConnectionOnConnectionStateChange(p *webrtc.PeerConnection, natSende
 				r, ok := report.(webrtc.ICECandidateStats)
 				if ok && r.ID == candidateId {
 					t := r.CandidateType.String()
+					ip := r.IP
+					port := r.Port
 					natSender.Dst2ConnectionType.Set(*dst, t)
-					log.Printf("connectionType %s \n", t)
+					log.Printf("connectionType %s, address %s:%d \n", t, ip, port)
 				}
 			}
 		}

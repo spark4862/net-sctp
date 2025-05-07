@@ -34,7 +34,7 @@ func init() {
 
 func main() {
 	dsts := strings.Split(*destination, ":")
-	natSender := sender.NewNatSender(*source, *signalingServer, func(msg []byte) { log.Print(string(msg)) }, logging.LogLevelWarn)
+	natSender := sender.NewNatSender(*source, *signalingServer, func(msg []byte) { log.Print(string(msg)) }, logging.LogLevelInfo)
 
 	if isListener {
 		natSender.Listen()
